@@ -7,12 +7,13 @@ use std::{
     str::{self},
 };
 
+use heck::{ToSnakeCase, ToUpperCamelCase};
 use once_cell::sync::Lazy;
 use prost::Message;
 use prost_build::Module;
 use prost_types::{
     compiler::{code_generator_response::File, CodeGeneratorRequest},
-    DescriptorProto, FileDescriptorProto,
+    DescriptorProto, EnumDescriptorProto, FileDescriptorProto,
 };
 
 use self::generator::{CoreProstGenerator, FileDescriptorSetGenerator};
@@ -25,6 +26,10 @@ pub use self::generator::{Error, Generator, GeneratorResultExt, Result};
 pub fn execute(raw_request: &[u8]) -> generator::Result {
     let request = CodeGeneratorRequest::decode(raw_request)?;
     let params = request.parameter().parse::<Parameters>()?;
+
+    // Computed before `request.proto_file` is moved into the module request set.
+    let crate_extern_paths =
+        crate_for_file_extern_paths(&request.proto_file, &params.prost.crate_for_file);
 
     let module_request_set = ModuleRequestSet::new(
         request.file_to_generate,
@@ -47,6 +52,12 @@ pub fn execute(raw_request: &[u8]) -> generator::Result {
     };
 
     let mut config = params.prost.to_prost_config();
+
+    // Extern the types owned by sibling / imported crates so prost references
+    // them instead of regenerating this package's imported members.
+    for (proto_path, rust_path) in &crate_extern_paths {
+        config.extern_path(proto_path, rust_path);
+    }
 
     if params.file_descriptor_set && params.prost_reflect {
         let mut messages = Vec::new();
@@ -87,6 +98,141 @@ fn collect_message_names(package_name: &str, messages: &[DescriptorProto], out: 
         let full_name = format!("{}.{}", package_name, message.name());
         out.push(full_name.clone());
         collect_message_names(&full_name, &message.nested_type, out);
+    }
+}
+
+/// Expands `crate_for_file` mappings (a proto file name and the Rust crate that
+/// owns the types it declares) into `(proto_path, rust_path)` extern pairs for
+/// every message and enum defined in those files, including nested types.
+///
+/// prost generates one Rust module per proto *package*, so when a package is
+/// split across one crate per file, an importer would otherwise regenerate its
+/// siblings' types. Feeding these pairs to `Config::extern_path` (and the serde
+/// / tonic equivalents) makes the importer reference each type through the crate
+/// that owns it -- `::owning_crate::pkg::Type` -- instead. The Rust paths are
+/// built with the exact same rules prost uses for its own modules and type
+/// names, so the references always resolve.
+pub fn crate_for_file_extern_paths(
+    proto_files: &[FileDescriptorProto],
+    crate_for_file: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut externs = Vec::new();
+    for (file_name, crate_name) in crate_for_file {
+        let Some(file) = proto_files
+            .iter()
+            .find(|file| file.name() == file_name.as_str())
+        else {
+            continue;
+        };
+        let package = file.package();
+        let proto_prefix = if package.is_empty() {
+            String::new()
+        } else {
+            format!(".{package}")
+        };
+        collect_crate_extern_paths(
+            crate_name,
+            package,
+            &proto_prefix,
+            &mut Vec::new(),
+            &file.message_type,
+            &file.enum_type,
+            &mut externs,
+        );
+    }
+    externs
+}
+
+fn collect_crate_extern_paths(
+    crate_name: &str,
+    package: &str,
+    proto_prefix: &str,
+    ancestors: &mut Vec<String>,
+    messages: &[DescriptorProto],
+    enums: &[EnumDescriptorProto],
+    out: &mut Vec<(String, String)>,
+) {
+    for enum_type in enums {
+        let proto_path = format!("{proto_prefix}.{}", enum_type.name());
+        let rust_path = rust_crate_path(crate_name, package, ancestors, enum_type.name());
+        out.push((proto_path, rust_path));
+    }
+    for message in messages {
+        let proto_path = format!("{proto_prefix}.{}", message.name());
+        let rust_path = rust_crate_path(crate_name, package, ancestors, message.name());
+        out.push((proto_path.clone(), rust_path));
+
+        ancestors.push(message.name().to_string());
+        collect_crate_extern_paths(
+            crate_name,
+            package,
+            &proto_path,
+            ancestors,
+            &message.nested_type,
+            &message.enum_type,
+            out,
+        );
+        ancestors.pop();
+    }
+}
+
+/// Builds the fully-qualified Rust path to a proto type inside its owning crate,
+/// matching prost's module layout exactly: package segments and enclosing
+/// messages become `to_snake` modules, the type identifier is `to_upper_camel`,
+/// and Rust keywords are raw-identifier escaped.
+fn rust_crate_path(
+    crate_name: &str,
+    package: &str,
+    ancestors: &[String],
+    type_name: &str,
+) -> String {
+    let mut path = format!("::{crate_name}");
+    for segment in package.split('.').filter(|segment| !segment.is_empty()) {
+        path.push_str("::");
+        path.push_str(&to_snake(segment));
+    }
+    for ancestor in ancestors {
+        path.push_str("::");
+        path.push_str(&to_snake(ancestor));
+    }
+    path.push_str("::");
+    path.push_str(&to_upper_camel(type_name));
+    path
+}
+
+/// `to_snake`, `to_upper_camel`, and `sanitize_identifier` mirror
+/// `prost-build`'s private `ident` module (same `heck` conversion, same keyword
+/// table). Reproduced here so the extern paths we emit are byte-identical to the
+/// module and type names prost generates in the owning crate.
+fn to_snake(s: &str) -> String {
+    sanitize_identifier(&s.to_snake_case())
+}
+
+fn to_upper_camel(s: &str) -> String {
+    sanitize_identifier(&s.to_upper_camel_case())
+}
+
+fn sanitize_identifier(ident: &str) -> String {
+    match ident {
+        // 2015 strict keywords.
+        "as" | "break" | "const" | "continue" | "else" | "enum" | "false" | "fn" | "for" | "if"
+        | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref"
+        | "return" | "static" | "struct" | "trait" | "true" | "type" | "unsafe" | "use"
+        | "where" | "while"
+        // 2018 strict keywords.
+        | "dyn"
+        // 2015 reserved keywords.
+        | "abstract" | "become" | "box" | "do" | "final" | "macro" | "override" | "priv"
+        | "typeof" | "unsized" | "virtual" | "yield"
+        // 2018 reserved keywords.
+        | "async" | "await" | "try"
+        // 2024 reserved keywords.
+        | "gen" => format!("r#{ident}"),
+        // Keywords that are not supported as raw identifiers; suffix instead.
+        "_" | "super" | "self" | "Self" | "extern" | "crate" => format!("{ident}_"),
+        // Identifiers beginning with a number; prefix with an underscore.
+        _ if ident.starts_with(|c: char| c.is_numeric()) => format!("_{ident}"),
+        _ => ident.to_string(),
     }
 }
 
@@ -300,6 +446,7 @@ struct ProstParameters {
     skip_debug: Vec<String>,
     default_package_filename: Option<String>,
     extern_path: Vec<(String, String)>,
+    crate_for_file: Vec<(String, String)>,
     type_attribute: Vec<(String, String)>,
     field_attribute: Vec<(String, String)>,
     enum_attribute: Vec<(String, String)>,
@@ -415,6 +562,11 @@ impl ProstParameters {
                 key: prefix,
                 value: module,
             } => self.extern_path.push((prefix.to_string(), module)),
+            Param::KeyValue {
+                param: "crate_for_file",
+                key: file,
+                value: crate_name,
+            } => self.crate_for_file.push((file.to_string(), crate_name)),
             Param::KeyValue {
                 param: "type_attribute",
                 key: prefix,
@@ -656,6 +808,50 @@ struct RawProtos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crate_for_file_extern_paths_matches_prost_naming() {
+        // Package `scarlet.match` exercises keyword escaping (`r#match`); the
+        // nested enum `Account.State` exercises the snake-cased parent module.
+        let file = FileDescriptorProto {
+            name: Some("apis/account.proto".to_owned()),
+            package: Some("scarlet.match".to_owned()),
+            message_type: vec![DescriptorProto {
+                name: Some("Account".to_owned()),
+                enum_type: vec![EnumDescriptorProto {
+                    name: Some("State".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            enum_type: vec![EnumDescriptorProto {
+                name: Some("Kind".to_owned()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mapping = vec![("apis/account.proto".to_owned(), "account_proto".to_owned())];
+
+        let externs = crate_for_file_extern_paths(std::slice::from_ref(&file), &mapping);
+
+        assert_eq!(
+            externs,
+            vec![
+                (
+                    ".scarlet.match.Kind".to_owned(),
+                    "::account_proto::scarlet::r#match::Kind".to_owned(),
+                ),
+                (
+                    ".scarlet.match.Account".to_owned(),
+                    "::account_proto::scarlet::r#match::Account".to_owned(),
+                ),
+                (
+                    ".scarlet.match.Account.State".to_owned(),
+                    "::account_proto::scarlet::r#match::account::State".to_owned(),
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn compiler_option_string_with_three_plus_equals_parses_correctly() {

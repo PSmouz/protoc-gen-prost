@@ -20,6 +20,19 @@ pub fn execute(raw_request: &[u8]) -> protoc_gen_prost::Result {
         builder.register_file_descriptor(file.clone());
     }
 
+    // Types owned by sibling / imported crates: reference their serde impls via
+    // extern_path, and exclude them so pbjson does not regenerate (and orphan-
+    // impl) serde for a type defined in another crate. `exclude` is a segment
+    // prefix filter, so excluding a message also excludes its nested types.
+    let crate_extern_paths =
+        protoc_gen_prost::crate_for_file_extern_paths(&request.proto_file, &params.crate_for_file);
+    for (proto_path, rust_path) in &crate_extern_paths {
+        builder.extern_path(proto_path, rust_path);
+    }
+    if !crate_extern_paths.is_empty() {
+        builder.exclude(crate_extern_paths.iter().map(|(proto_path, _)| proto_path.clone()));
+    }
+
     let module_request_set = ModuleRequestSet::new(
         request.file_to_generate,
         request.proto_file,
@@ -41,6 +54,7 @@ pub fn execute(raw_request: &[u8]) -> protoc_gen_prost::Result {
 struct Parameters {
     default_package_filename: Option<String>,
     extern_path: Vec<(String, String)>,
+    crate_for_file: Vec<(String, String)>,
     retain_enum_prefix: bool,
     preserve_proto_field_names: bool,
     ignore_unknown_fields: bool,
@@ -170,6 +184,11 @@ impl str::FromStr for Parameters {
                     key: prefix,
                     value: module,
                 } => ret_val.extern_path.push((prefix.to_string(), module)),
+                Param::KeyValue {
+                    param: "crate_for_file",
+                    key: file,
+                    value: crate_name,
+                } => ret_val.crate_for_file.push((file.to_string(), crate_name)),
                 Param::Value {
                     param: "btree_map",
                     value,

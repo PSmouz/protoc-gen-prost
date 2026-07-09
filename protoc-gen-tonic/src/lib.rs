@@ -18,6 +18,11 @@ pub fn execute(raw_request: &[u8]) -> protoc_gen_prost::Result {
     let request = CodeGeneratorRequest::decode(raw_request)?;
     let params = request.parameter().parse::<Parameters>()?;
 
+    // Computed before `request.proto_file` is moved into the module request set;
+    // the service code references message types through the crate that owns them.
+    let crate_extern_paths =
+        protoc_gen_prost::crate_for_file_extern_paths(&request.proto_file, &params.crate_for_file);
+
     let module_request_set = ModuleRequestSet::new(
         request.file_to_generate,
         request.proto_file,
@@ -26,7 +31,9 @@ pub fn execute(raw_request: &[u8]) -> protoc_gen_prost::Result {
         params.flat_output_dir,
     )?;
 
-    let resolver = Resolver::new(params.extern_path, params.compile_well_known_types);
+    let mut extern_path = params.extern_path;
+    extern_path.extend(crate_extern_paths);
+    let resolver = Resolver::new(extern_path, params.compile_well_known_types);
     let mut generator = TonicGenerator {
         resolver,
         generate_server: !params.no_server,
@@ -50,6 +57,7 @@ pub fn execute(raw_request: &[u8]) -> protoc_gen_prost::Result {
 struct Parameters {
     default_package_filename: Option<String>,
     extern_path: Vec<(String, String)>,
+    crate_for_file: Vec<(String, String)>,
     server_attributes: Attributes,
     client_attributes: Attributes,
     compile_well_known_types: bool,
@@ -79,6 +87,11 @@ impl str::FromStr for Parameters {
                     key: prefix,
                     value: module,
                 } => ret_val.extern_path.push((prefix.to_string(), module)),
+                Param::KeyValue {
+                    param: "crate_for_file",
+                    key: file,
+                    value: crate_name,
+                } => ret_val.crate_for_file.push((file.to_string(), crate_name)),
                 Param::Parameter {
                     param: "compile_well_known_types",
                 }

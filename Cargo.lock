@@ -243,6 +243,7 @@ dependencies = [
 name = "protoc-gen-prost"
 version = "0.5.0"
 dependencies = [
+ "heck",
  "once_cell",
  "prost",
  "prost-build",
