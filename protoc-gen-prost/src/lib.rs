@@ -158,6 +158,18 @@ fn collect_crate_extern_paths(
         out.push((proto_path, rust_path));
     }
     for message in messages {
+        // Synthetic map-entry messages are not generated as structs (prost emits
+        // map fields as HashMaps), so externing them would name a type that does
+        // not exist. They also cannot nest further, so skip them entirely.
+        if message
+            .options
+            .as_ref()
+            .and_then(|options| options.map_entry)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
         let proto_path = format!("{proto_prefix}.{}", message.name());
         let rust_path = rust_crate_path(crate_name, package, ancestors, message.name());
         out.push((proto_path.clone(), rust_path));
@@ -818,6 +830,15 @@ mod tests {
             package: Some("scarlet.match".to_owned()),
             message_type: vec![DescriptorProto {
                 name: Some("Account".to_owned()),
+                nested_type: vec![DescriptorProto {
+                    // A synthetic map-entry message must not be externed.
+                    name: Some("LabelsEntry".to_owned()),
+                    options: Some(prost_types::MessageOptions {
+                        map_entry: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
                 enum_type: vec![EnumDescriptorProto {
                     name: Some("State".to_owned()),
                     ..Default::default()
